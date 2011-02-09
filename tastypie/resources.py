@@ -11,7 +11,7 @@ from tastypie.authorization import ReadOnlyAuthorization
 from tastypie.bundle import Bundle
 from tastypie.cache import NoCache
 from tastypie.constants import ALL, ALL_WITH_RELATIONS
-from tastypie.exceptions import NotFound, BadRequest, InvalidFilterError, HydrationError, InvalidSortError, ImmediateHttpResponse, ForbiddenError
+from tastypie.exceptions import NotFound, BadRequest, InvalidFilterError, HydrationError, InvalidSortError, ImmediateHttpResponse
 from tastypie.fields import *
 from tastypie.http import *
 from tastypie.paginator import Paginator
@@ -987,9 +987,6 @@ class Resource(object):
         except NotFound:
             updated_bundle = self.obj_create(bundle, request=request, pk=kwargs.get('pk'))
             return HttpCreated(location=self.get_resource_uri(updated_bundle))
-        # If the action is not allowed
-        except ForbiddenError:
-            return HttpForbidden()
     
     def post_list(self, request, **kwargs):
         """
@@ -1450,7 +1447,7 @@ class ModelResource(Resource):
                     self._meta.queryset.get(**lookup_kwargs)
                     
                     # It does, so the user just isn't allowed to see it
-                    raise ForbiddenError()
+                    raise ImmediateHttpResponse(response=HttpMethodNotAllowed())
                 except ObjectDoesNotExist:
                     # It did not, so this object really doesn't exist
                     raise NotFound("A model instance matching the provided arguments could not be found.")
