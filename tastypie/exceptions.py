@@ -84,3 +84,10 @@ class ImmediateHttpResponse(TastypieError):
     
     def __init__(self, response):
         self.response = response
+        
+class ForbiddenError(TastypieError):
+    """
+    Used when authentication fails i.e. user is trying to do something they
+    are not allowed to do.
+    """
+    pass
