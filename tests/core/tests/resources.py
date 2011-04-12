@@ -15,6 +15,7 @@ from tastypie.authorization import Authorization
 from tastypie.bundle import Bundle
 from tastypie.exceptions import InvalidFilterError, InvalidSortError, ImmediateHttpResponse, BadRequest, NotFound
 from tastypie import fields
+from tastypie.paginator import Paginator
 from tastypie.resources import Resource, ModelResource, ALL, ALL_WITH_RELATIONS
 from tastypie.serializers import Serializer
 from tastypie.throttle import CacheThrottle
@@ -91,6 +92,14 @@ class NoUriBasicResource(BasicResource):
     class Meta:
         object_class = TestObject
         include_resource_uri = False
+
+
+class NullableNameResource(Resource):
+    name = fields.CharField(attribute='name', null=True)
+
+    class Meta:
+        object_class = TestObject
+        resource_name = 'nullable_name'
 
 
 class ResourceTestCase(TestCase):
@@ -257,6 +266,25 @@ class ResourceTestCase(TestCase):
         self.assertEqual(hydrated.obj.view_count, 6)
         self.assertEqual(hydrated.obj.date_joined, datetime.datetime(2010, 2, 15, 12, 0, 0))
         self.assertEqual(hydrated.obj.bar, 'O HAI BAR!')
+        
+        # Test that a nullable value with a previous non-null value
+        # can be set to None.
+        nullable = NullableNameResource()
+        obj = nullable._meta.object_class()
+        obj.name = "Daniel"
+        null_bundle = Bundle(obj=obj, data={'name': None})
+        hydrated = nullable.full_hydrate(null_bundle)
+        
+        self.assertTrue(hydrated.obj.name is None)
+        
+        # Test that a nullable value with a previous non-null value
+        # is not overridden if no value was given
+        obj = nullable._meta.object_class()
+        obj.name = "Daniel"
+        empty_null_bundle = Bundle(obj=obj, data={})
+        hydrated = nullable.full_hydrate(empty_null_bundle)
+        
+        self.assertEquals(hydrated.obj.name, "Daniel")
     
     def test_obj_get_list(self):
         basic = BasicResource()
@@ -491,6 +519,21 @@ class VeryCustomNoteResource(NoteResource):
         fields = ['title', 'content', 'created', 'is_active']
 
 
+class CustomPaginator(Paginator):
+    def page(self):
+        data = super(CustomPaginator, self).page()
+        data['extra'] = 'Some extra stuff here.'
+        return data
+
+
+class CustomPageNoteResource(NoteResource):
+    class Meta:
+        limit = 10
+        resource_name = 'pagey'
+        paginator_class = CustomPaginator
+        queryset = Note.objects.all()
+
+
 class UserResource(ModelResource):
     class Meta:
         queryset = User.objects.all()
@@ -559,6 +602,9 @@ class SubjectResource(ModelResource):
     class Meta:
         queryset = Subject.objects.all()
         resource_name = 'subjects'
+        filtering = {
+            'name': ALL,
+        }
 
 
 class RelatedNoteResource(ModelResource):
@@ -573,6 +619,18 @@ class RelatedNoteResource(ModelResource):
             'subjects': ALL_WITH_RELATIONS,
         }
         fields = ['title', 'slug', 'content', 'created', 'is_active']
+
+
+class AnotherSubjectResource(ModelResource):
+    notes = fields.ToManyField(DetailedNoteResource, 'notes')
+    
+    class Meta:
+        queryset = Subject.objects.all()
+        resource_name = 'anothersubjects'
+        excludes = ['notes']
+        filtering = {
+            'notes': ALL_WITH_RELATIONS,
+        }
 
 
 class AnotherRelatedNoteResource(ModelResource):
@@ -590,8 +648,15 @@ class AnotherRelatedNoteResource(ModelResource):
 
 
 class NullableRelatedNoteResource(AnotherRelatedNoteResource):
-    author = fields.ForeignKey(UserResource, 'author')
+    author = fields.ForeignKey(UserResource, 'author', null=True)
     subjects = fields.ManyToManyField(SubjectResource, 'subjects', null=True)
+
+
+class TestOptionsResource(ModelResource):
+    class Meta:
+        queryset = Note.objects.all()
+        allowed_methods = ['post']
+        list_allowed_methods = ['post', 'put']
 
 
 # Per user authorization bits.
@@ -674,18 +739,39 @@ class ModelResourceTestCase(TestCase):
         
         # Test to make sure that, even with a mix of basic & advanced
         # configuration, options are set right.
-        class TestOptionsResource(ModelResource):
-            class Meta:
-                queryset = Note.objects.all()
-                allowed_methods = ['post']
-                list_allowed_methods = ['post', 'put']
-        
         resource_5 = TestOptionsResource()
         self.assertEqual(resource_5._meta.allowed_methods, ['post'])
         # Should be the overridden values.
         self.assertEqual(resource_5._meta.list_allowed_methods, ['post', 'put'])
         # Should inherit from the basic configuration.
         self.assertEqual(resource_5._meta.detail_allowed_methods, ['post'])
+        
+        resource_6 = CustomPageNoteResource()
+        self.assertEqual(resource_6._meta.paginator_class, CustomPaginator)
+    
+    def test_can_create(self):
+        resource_1 = NoteResource()
+        self.assertEqual(resource_1.can_create(), True)
+        
+        resource_2 = LightlyCustomNoteResource()
+        self.assertEqual(resource_2.can_create(), False)
+    
+    def test_can_update(self):
+        resource_1 = NoteResource()
+        self.assertEqual(resource_1.can_update(), True)
+        
+        resource_2 = LightlyCustomNoteResource()
+        self.assertEqual(resource_2.can_update(), False)
+        
+        resource_3 = TestOptionsResource()
+        self.assertEqual(resource_3.can_update(), True)
+    
+    def test_can_delete(self):
+        resource_1 = NoteResource()
+        self.assertEqual(resource_1.can_delete(), True)
+        
+        resource_2 = LightlyCustomNoteResource()
+        self.assertEqual(resource_2.can_delete(), False)
     
     def test_fields(self):
         # Different from the ``ResourceTestCase.test_fields``, we're checking
@@ -797,6 +883,11 @@ class ModelResourceTestCase(TestCase):
         # Valid simple (explicit ``__exact``).
         self.assertEqual(resource.build_filters(filters={'title__exact': 'Hello world.'}), {'title__exact': 'Hello world.'})
         
+        # Valid in.
+        self.assertEqual(resource.build_filters(filters={'title__in': ''}), {'title__in': ''})
+        self.assertEqual(resource.build_filters(filters={'title__in': 'foo'}), {'title__in': ['foo']})
+        self.assertEqual(resource.build_filters(filters={'title__in': 'foo,bar'}), {'title__in': ['foo', 'bar']})
+        
         # Valid simple (non-``__exact``).
         self.assertEqual(resource.build_filters(filters={'content__startswith': 'Hello'}), {'content__startswith': 'Hello'})
         
@@ -835,6 +926,19 @@ class ModelResourceTestCase(TestCase):
         
         # Allow relationship traversal.
         self.assertEqual(resource_3.build_filters(filters={'subjects__name__startswith': 'News'}), {'subjects__name__startswith': 'News'})
+        
+        # Ensure related fields that do not have filtering throw an exception.
+        self.assertRaises(InvalidFilterError, resource_3.build_filters, filters={'subjects__url__startswith': 'News'})
+        
+        # Ensure related fields that do not exist throw an exception.
+        self.assertRaises(InvalidFilterError, resource_3.build_filters, filters={'subjects__foo__startswith': 'News'})
+        
+        # Check where the field name doesn't match the database relation.
+        resource_4 = AnotherSubjectResource()
+        self.assertEqual(resource_4.build_filters(filters={'notes__user__startswith': 'Daniel'}), {'notes__author__startswith': 'Daniel'})
+        
+        # Make sure that fields that don't have attributes can't be filtered on.
+        self.assertRaises(InvalidFilterError, resource_4.build_filters, filters={'notes__hello_world': 'News'})
     
     def test_apply_sorting(self):
         resource = NoteResource()
@@ -1721,6 +1825,20 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(len(yetanother._meta.queryset.all()), 6)
         self.assertEqual(yetanother._meta.resource_name, 'yetanothermini')
     
+    def test_nullable_toone_full_hydrate(self):
+        nrrnr = NullableRelatedNoteResource()
+        
+        # Regression: not specifying the ToOneField should still work if
+        # it is nullable.
+        bundle_1 = Bundle(data={
+            'subjects': [],
+        })
+        
+        hydrated1 = nrrnr.full_hydrate(bundle_1)
+        
+        self.assertEqual(hydrated1.data.get('author'), None)
+        self.assertEqual(hydrated1.data['subjects'], [])
+    
     def test_nullable_tomany_full_hydrate(self):
         nrrnr = NullableRelatedNoteResource()
         bundle_1 = Bundle(data={
@@ -1804,6 +1922,14 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(resp.content, '{"content": "This is my very first post using my shiny new API. Pretty sweet, huh?", "created": "2010-03-30T20:05:00", "id": "1", "is_active": true, "resource_uri": "/api/v1/notes/1/", "slug": "first-post", "title": "First Post!", "updated": "2010-03-30T20:05:00"}')
         self.assertTrue(resp.has_header('cache-control'))
         self.assertEqual(resp._headers['cache-control'], ('Cache-Control', 'no-cache'))
+    
+    def test_custom_paginator(self):
+        mock_request = MockRequest()
+        customs = CustomPageNoteResource().get_list(mock_request)
+        data = json.loads(customs.content)
+        self.assertEqual(len(data), 3)
+        self.assertEqual(len(data['objects']), 6)
+        self.assertEqual(data['extra'], 'Some extra stuff here.')
 
 
 class BasicAuthResourceTestCase(TestCase):
@@ -1945,4 +2071,3 @@ class BustedResourceTestCase(TestCase):
         self.assertEqual(resp.content, '{"error_message": "Oops, you bwoke it."}')
         self.assertEqual(len(mail.outbox), 3)
         mail.outbox = []
-    

@@ -1,6 +1,5 @@
 from dateutil.parser import parse
 import re
-from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 from django.utils import datetime_safe, importlib
 from tastypie.bundle import Bundle
@@ -178,24 +177,21 @@ class FileField(ApiField):
     Covers both ``models.FileField`` and ``models.ImageField``.
     """
     dehydrated_type = 'string'
-    help_text = 'A file path as a string. Ex: "/tmp/photos/my_photo.jpg"'
+    help_text = 'A file URL as a string. Ex: "http://media.example.com/media/photos/my_photo.jpg"'
     
     def dehydrate(self, obj):
-        media_url = settings.MEDIA_URL
-        path = self.convert(super(FileField, self).dehydrate(obj))
-        
-        if path:
-            media_url = media_url.rstrip('/')
-            path = path.lstrip('/')
-            return u"%s/%s" % (media_url, path)
-        
-        return path
+        return self.convert(super(FileField, self).dehydrate(obj))
     
     def convert(self, value):
         if value is None:
             return None
         
-        return unicode(value)
+        try:
+            # Try to return the URL if it's a ``File``, falling back to the string
+            # itself if it's been overridden or is a default.
+            return getattr(value, 'url', value)
+        except ValueError:
+            return None
 
 
 class IntegerField(ApiField):
@@ -337,8 +333,8 @@ class RelatedField(ApiField):
     """
     Provides access to data that is related within the database.
     
-    A base class not intended for direct use but provides functionality that
-    ``ForeignKey`` and ``ManyToManyField`` build upon.
+    The ``RelatedField`` base class is not intended for direct use but provides
+    functionality that ``ToOneField`` and ``ToManyField`` build upon.
     
     The contents of this field actually point to another ``Resource``,
     rather than the related object. This allows the field to represent its data
@@ -497,14 +493,23 @@ class RelatedField(ApiField):
             # Try to hydrate the data provided.
             value = dict_strip_unicode_keys(value)
             self.fk_bundle = Bundle(data=value)
+            
+            # We need to check to see if updates are allowed on the FK
+            # resource. If not, we'll just return a populated bundle instead
+            # of mistakenly updating something that should be read-only.
+            if not self.fk_resource.can_update():
+                return self.fk_resource.full_hydrate(self.fk_bundle)
+            
             try:
                 return self.fk_resource.obj_update(self.fk_bundle, **value)
             except NotFound:
                 try:
                     # Attempt lookup by primary key
                     lookup_kwargs = dict((k, v) for k, v in value.iteritems() if getattr(self.fk_resource, k).unique)
+                    
                     if not lookup_kwargs:
-                        raise NotFound
+                        raise NotFound()
+                    
                     return self.fk_resource.obj_update(self.fk_bundle, **lookup_kwargs)
                 except NotFound:
                     return self.fk_resource.full_hydrate(self.fk_bundle)

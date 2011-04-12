@@ -1,7 +1,7 @@
 import warnings
 from django.conf import settings
 from django.conf.urls.defaults import patterns, url
-from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
+from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned, ValidationError
 from django.core.urlresolvers import NoReverseMatch, reverse, resolve, Resolver404
 from django.db.models.sql.constants import QUERY_TERMS, LOOKUP_SEP
 from django.http import HttpResponse, HttpResponseNotFound
@@ -48,6 +48,7 @@ class ResourceOptions(object):
     cache = NoCache()
     throttle = BaseThrottle()
     validation = Validation()
+    paginator_class = Paginator
     allowed_methods = ['get', 'post', 'put', 'delete']
     list_allowed_methods = None
     detail_allowed_methods = None
@@ -82,9 +83,6 @@ class ResourceOptions(object):
         
         if overrides.get('detail_allowed_methods', None) is None:
             overrides['detail_allowed_methods'] = allowed_methods
-        
-        if not overrides.get('queryset', None) is None:
-            overrides['object_class'] = overrides['queryset'].model
         
         return object.__new__(type('ResourceOptions', (cls,), overrides))
 
@@ -186,6 +184,8 @@ class Resource(object):
                 return response
             except (BadRequest, ApiFieldError), e:
                 return HttpBadRequest(e.args[0])
+            except ValidationError, e:
+                return HttpBadRequest(', '.join(e.messages))
             except Exception, e:
                 if hasattr(e, 'response'):
                     return e.response
@@ -214,7 +214,7 @@ class Resource(object):
         
         if settings.DEBUG:
             data = {
-                "error_message": exception.message,
+                "error_message": unicode(exception),
                 "traceback": the_trace,
             }
             desired_format = self.determine_format(request)
@@ -417,6 +417,12 @@ class Resource(object):
         
         request_method = request.method.lower()
         
+        if request_method == "options":
+            allows = ','.join(map(str.upper, allowed))
+            response = HttpResponse(allows)
+            response['Allow'] = allows
+            raise ImmediateHttpResponse(response=response)
+        
         if not request_method in allowed:
             raise ImmediateHttpResponse(response=HttpMethodNotAllowed())
         
@@ -611,13 +617,14 @@ class Resource(object):
             if field_object.attribute:
                 value = field_object.hydrate(bundle)
                 
-                if value is not None:
+                if value is not None or field_object.null:
                     # We need to avoid populating M2M data here as that will
                     # cause things to blow up.
                     if not getattr(field_object, 'is_related', False):
                         setattr(bundle.obj, field_object.attribute, value)
                     elif not getattr(field_object, 'is_m2m', False):
-                        setattr(bundle.obj, field_object.attribute, value.obj)
+                        if value is not None:
+                            setattr(bundle.obj, field_object.attribute, value.obj)
             
             # Check for an optional method to do further hydration.
             method = getattr(self, "hydrate_%s" % field_name, None)
@@ -747,6 +754,29 @@ class Resource(object):
             object_list = self._meta.authorization.apply_limits(request, object_list)
         
         return object_list
+    
+    def can_create(self):
+        """
+        Checks to ensure ``post`` is within ``allowed_methods``.
+        """
+        allowed = set(self._meta.list_allowed_methods + self._meta.detail_allowed_methods)
+        return 'post' in allowed
+    
+    def can_update(self):
+        """
+        Checks to ensure ``put`` is within ``allowed_methods``.
+        
+        Used when hydrating related data.
+        """
+        allowed = set(self._meta.list_allowed_methods + self._meta.detail_allowed_methods)
+        return 'put' in allowed
+    
+    def can_delete(self):
+        """
+        Checks to ensure ``delete`` is within ``allowed_methods``.
+        """
+        allowed = set(self._meta.list_allowed_methods + self._meta.detail_allowed_methods)
+        return 'delete' in allowed
     
     def obj_get_list(self, request=None, **kwargs):
         """
@@ -905,8 +935,7 @@ class Resource(object):
         objects = self.obj_get_list(request=request, **self.remove_api_resource_names(kwargs))
         sorted_objects = self.apply_sorting(objects, options=request.GET)
         
-        paginator = Paginator(request.GET, sorted_objects, resource_uri=self.get_resource_list_uri(),
-           limit=self._meta.limit)
+        paginator = self._meta.paginator_class(request.GET, sorted_objects, resource_uri=self.get_resource_list_uri(), limit=self._meta.limit)
         to_be_serialized = paginator.page()
         
         # Dehydrate the bundles in preparation for serialization.
@@ -1095,6 +1124,11 @@ class Resource(object):
 
 class ModelDeclarativeMetaclass(DeclarativeMetaclass):
     def __new__(cls, name, bases, attrs):
+        meta = attrs.get('Meta')
+        
+        if meta and hasattr(meta, 'queryset'):
+            setattr(meta, 'object_class', meta.queryset.model)
+        
         new_class = super(ModelDeclarativeMetaclass, cls).__new__(cls, name, bases, attrs)
         fields = getattr(new_class._meta, 'fields', [])
         excludes = getattr(new_class._meta, 'excludes', [])
@@ -1207,6 +1241,7 @@ class ModelResource(Resource):
             
             kwargs = {
                 'attribute': f.name,
+                'help_text': f.help_text,
             }
             
             if f.null is True:
@@ -1227,6 +1262,48 @@ class ModelResource(Resource):
             final_fields[f.name].instance_name = f.name
         
         return final_fields
+    
+    def check_filtering(self, field_name, filter_type='exact', filter_bits=None):
+        """
+        Given a field name, a optional filter type and an optional list of
+        additional relations, determine if a field can be filtered on.
+        
+        If a filter does not meet the needed conditions, it should raise an
+        ``InvalidFilterError``.
+        
+        If the filter meets the conditions, a list of attribute names (not
+        field names) will be returned.
+        """
+        if filter_bits is None:
+            filter_bits = []
+        
+        if not field_name in self._meta.filtering:
+            raise InvalidFilterError("The '%s' field does not allow filtering." % field_name)
+        
+        # Check to see if it's an allowed lookup type.
+        if not self._meta.filtering[field_name] in (ALL, ALL_WITH_RELATIONS):
+            # Must be an explicit whitelist.
+            if not filter_type in self._meta.filtering[field_name]:
+                raise InvalidFilterError("'%s' is not an allowed filter on the '%s' field." % (filter_type, field_name))
+        
+        if self.fields[field_name].attribute is None:
+            raise InvalidFilterError("The '%s' field has no 'attribute' for searching with." % field_name)
+        
+        # Check to see if it's a relational lookup and if that's allowed.
+        if len(filter_bits):
+            if not getattr(self.fields[field_name], 'is_related', False):
+                raise InvalidFilterError("The '%s' field does not support relations." % field_name)
+            
+            if not self._meta.filtering[field_name] == ALL_WITH_RELATIONS:
+                raise InvalidFilterError("Lookups are not allowed more than one level deep on the '%s' field." % field_name)
+            
+            # Recursively descend through the remaining lookups in the filter,
+            # if any. We should ensure that all along the way, we're allowed
+            # to filter on that field by the related resource.
+            related_resource = self.fields[field_name].get_related_resource(None)
+            return [self.fields[field_name].attribute] + related_resource.check_filtering(filter_bits[0], filter_type, filter_bits[1:])
+        
+        return [self.fields[field_name].attribute]
     
     def build_filters(self, filters=None):
         """
@@ -1254,32 +1331,17 @@ class ModelResource(Resource):
         
         for filter_expr, value in filters.items():
             filter_bits = filter_expr.split(LOOKUP_SEP)
+            field_name = filter_bits.pop(0)
+            filter_type = 'exact'
             
-            if not filter_bits[0] in self.fields:
+            if not field_name in self.fields:
                 # It's not a field we know about. Move along citizen.
                 continue
             
-            if not filter_bits[0] in self._meta.filtering:
-                raise InvalidFilterError("The '%s' field does not allow filtering." % filter_bits[0])
-            
-            if filter_bits[-1] in QUERY_TERMS.keys():
+            if len(filter_bits) and filter_bits[-1] in QUERY_TERMS.keys():
                 filter_type = filter_bits.pop()
-            else:
-                filter_type = 'exact'
             
-            # Check to see if it's allowed lookup type.
-            if not self._meta.filtering[filter_bits[0]] in (ALL, ALL_WITH_RELATIONS):
-                # Must be an explicit whitelist.
-                if not filter_type in self._meta.filtering[filter_bits[0]]:
-                    raise InvalidFilterError("'%s' is not an allowed filter on the '%s' field." % (filter_expr, filter_bits[0]))
-            
-            # Check to see if it's a relational lookup and if that's allowed.
-            if len(filter_bits) > 1:
-                if not self._meta.filtering[filter_bits[0]] == ALL_WITH_RELATIONS:
-                    raise InvalidFilterError("Lookups are not allowed more than one level deep on the '%s' field." % filter_bits[0])
-            
-            if self.fields[filter_bits[0]].attribute is None:
-                raise InvalidFilterError("The '%s' field has no 'attribute' for searching with." % filter_bits[0])
+            lookup_bits = self.check_filtering(field_name, filter_type, filter_bits)
             
             if value in ['true', 'True', True]:
                 value = True
@@ -1288,7 +1350,11 @@ class ModelResource(Resource):
             elif value in ('nil', 'none', 'None', None):
                 value = None
             
-            db_field_name = LOOKUP_SEP.join([self.fields[filter_bits[0]].attribute] + filter_bits[1:])
+            # Split on ',' if not empty string and either an in or range filter.
+            if filter_type in ('in', 'range') and len(value):
+                value = value.split(',')
+            
+            db_field_name = LOOKUP_SEP.join(lookup_bits)
             qs_filter = "%s%s%s" % (db_field_name, LOOKUP_SEP, filter_type)
             qs_filters[qs_filter] = value
         
